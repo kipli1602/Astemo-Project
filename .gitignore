@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*$super.pyc
+*.egg-info/
+*.egg
+dist/
+build/
+eggs/
+
+# Virtual Environments
+.venv/
+venv/
+venv.bak/
+env/
+env.bak/
+.env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Python poetry / pip
+poetry.lock
+pip-wheel-metadata/
+
+# ML / Data Science
+*.h5
+*.model
+*.weights
+runs/
+wandb/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Exported.pfb
+.fseventsd
+.HouzzCache
+.TemporaryItems
+.VolumeIcon.icns
+
+# Logs
+*.log
+logs/
