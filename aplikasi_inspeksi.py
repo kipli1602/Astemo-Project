@@ -1,25 +1,105 @@
 import os
-os.environ["FLAGS_enable_pir_api"] = "0" 
-os.environ["FLAGS_use_mkldnn"] = "0"      
+os.environ["FLAGS_enable_pir_api"] = "0"
+os.environ["FLAGS_use_mkldnn"] = "0"
 
-import torch
 import cv2
 import tkinter as tk
 from tkinter import ttk
-from ultralytics import YOLO
-from paddleocr import PaddleOCR
 import numpy as np
 import re
+import glob
+import multiprocessing
+
 
 def setup_device_ai():
     """Mendeteksi dan mengonfigurasi GPU secara otomatis"""
+    import torch
     if torch.cuda.is_available():
         gpu_name = torch.cuda.get_device_name(0)
         print(f"\n[INFO] GPU Terdeteksi & Aktif: {gpu_name}")
-        return True, 0  
+        return True, 0
     else:
         print("\n[INFO] Peringatan: GPU tidak tersedia, sistem beralih menggunakan CPU.")
         return False, 'cpu'
+
+
+def _add_nvidia_dll_dirs():
+    """Tambahkan direktori DLL NVIDIA ke PATH agar PaddlePaddle-GPU dapat menemukan cuDNN"""
+    venv_site_packages = os.path.join(
+        os.path.dirname(__file__), ".venv", "Lib", "site-packages"
+    )
+    fallback_site = os.path.join(
+        os.path.dirname(__file__), "Lib", "site-packages"
+    )
+    for base in [venv_site_packages, fallback_site]:
+        for pattern in [
+            "nvidia/cublas/bin",
+            "nvidia/cuda_nvrtc/bin",
+            "nvidia/cudnn/bin",
+        ]:
+            d = os.path.join(base, pattern)
+            if os.path.isdir(d):
+                os.add_dll_directory(d)
+                os.environ["PATH"] = d + os.pathsep + os.environ["PATH"]
+
+
+def _ocr_worker(image_queue, result_queue, use_gpu):
+    """Worker process untuk PaddleOCR — berjalan di proses terpisah agar tidak bertabrakan DLL dengan PyTorch"""
+    _add_nvidia_dll_dirs()
+    from paddleocr import PaddleOCR
+
+    try:
+        ocr = PaddleOCR(
+            use_textline_orientation=False,
+            lang='en',
+            use_angle_cls=True,
+            det_db_thresh=0.3,
+            rec_algorithm='SVTR_LCNet',
+            show_log=False,
+            use_gpu=use_gpu
+        )
+    except Exception:
+        ocr = PaddleOCR(use_textline_orientation=False, lang='en', use_angle_cls=True, show_log=False)
+
+    while True:
+        item = image_queue.get()
+        if item is None:
+            break
+
+        img, img_processed = item
+        try:
+            hasil_ocr1 = ocr.ocr(img, cls=False)
+            hasil_ocr2 = ocr.ocr(img_processed, cls=False)
+            result_queue.put((hasil_ocr1, hasil_ocr2))
+        except Exception:
+            result_queue.put((None, None))
+
+
+class OcrManager:
+    """Mengelola proses worker PaddleOCR secara terpisah untuk menghindari konflik DLL pada Windows"""
+    def __init__(self, use_gpu):
+        ctx = multiprocessing.get_context('spawn')
+        self.image_queue = ctx.Queue()
+        self.result_queue = ctx.Queue()
+        self.process = ctx.Process(
+            target=_ocr_worker,
+            args=(self.image_queue, self.result_queue, use_gpu),
+            daemon=True
+        )
+        self.process.start()
+
+    def ocr(self, img, img_processed):
+        """Kirim gambar ke worker proses, terima hasil OCR"""
+        self.image_queue.put((img, img_processed))
+        return self.result_queue.get()
+
+    def shutdown(self):
+        self.image_queue.put(None)
+        self.process.join(timeout=5)
+        if self.process.is_alive():
+            self.process.terminate()
+            self.process.join(timeout=2)
+
 
 def preprocessing_gambar(img):
     """Preprocessing gambar untuk meningkatkan akurasi OCR"""
@@ -57,27 +137,17 @@ def fuzzy_match(teks, target, toleransi=1):
     return False, 0
 
 def jalankan_inspeksi(target_kode):
+    from ultralytics import YOLO
     print(f"\nSistem Aktif! Menyeleksi Kardus: {target_kode}")
-    
+
     gunakan_gpu, device_yolo = setup_device_ai()
-    model = YOLO("best.pt") 
+    model = YOLO("best.pt")
+
+    ocr_manager = OcrManager(use_gpu=gunakan_gpu)
+
+    memori_kardus = {}
     
-    try:
-        ocr = PaddleOCR(
-            use_textline_orientation=False, 
-            lang='en',
-            use_angle_cls=True, 
-            det_db_thresh=0.3,   
-            rec_algorithm='SVTR_LCNet', 
-            show_log=False,
-            use_gpu=gunakan_gpu
-        )
-    except Exception:
-        ocr = PaddleOCR(use_textline_orientation=False, lang='en', use_angle_cls=True, show_log=False)
-    
-    memori_kardus = {} 
-    
-    index_kamera_usb = 2
+    index_kamera_usb = 1
     cap = cv2.VideoCapture(index_kamera_usb)
     if not cap.isOpened():
         print(f"[PERINGATAN] USB Webcam pada index {index_kamera_usb} tidak ditemukan. Mencoba beralih ke index 0...")
@@ -115,9 +185,8 @@ def jalankan_inspeksi(target_kode):
                     potongan_stiker = frame[y1:y2, x1:x2]
                     if potongan_stiker.size > 0:
                         img_processed = preprocessing_gambar(potongan_stiker)
-                        
-                        hasil_ocr1 = ocr.ocr(potongan_stiker, cls=False)
-                        hasil_ocr2 = ocr.ocr(img_processed, cls=False)
+
+                        hasil_ocr1, hasil_ocr2 = ocr_manager.ocr(potongan_stiker, img_processed)
                         
                         semua_teks = []
                         if hasil_ocr1 and hasil_ocr1[0] is not None:
@@ -177,25 +246,28 @@ def jalankan_inspeksi(target_kode):
 
     cap.release()
     cv2.destroyAllWindows()
+    ocr_manager.shutdown()
 
 def mulai_program():
     target_dipilih = combo_target.get()
     if target_dipilih:
-        root.destroy() 
-        jalankan_inspeksi(target_dipilih) 
+        root.destroy()
+        jalankan_inspeksi(target_dipilih)
 
-root = tk.Tk()
-root.title("Menu Operator Inspeksi")
-root.geometry("300x200")
-root.eval('tk::PlaceWindow . center')
 
-tk.Label(root, text="Pilih Target Hari Ini:", font=("Arial", 12)).pack(pady=20)
+if __name__ == '__main__':
+    root = tk.Tk()
+    root.title("Menu Operator Inspeksi")
+    root.geometry("300x200")
+    root.eval('tk::PlaceWindow . center')
 
-daftar_kode = ["K81", "K80", "K59", "K93"]
-combo_target = ttk.Combobox(root, values=daftar_kode, font=("Arial", 14), state="readonly")
-combo_target.current(0) 
-combo_target.pack(pady=10)
+    tk.Label(root, text="Pilih Target Hari Ini:", font=("Arial", 12)).pack(pady=20)
 
-tk.Button(root, text="Mulai Kamera Inspeksi", command=mulai_program, bg="green", fg="white", font=("Arial", 12)).pack(pady=20)
+    daftar_kode = ["K81", "K80", "K59", "K93"]
+    combo_target = ttk.Combobox(root, values=daftar_kode, font=("Arial", 14), state="readonly")
+    combo_target.current(0)
+    combo_target.pack(pady=10)
 
-root.mainloop()
+    tk.Button(root, text="Mulai Kamera Inspeksi", command=mulai_program, bg="green", fg="white", font=("Arial", 12)).pack(pady=20)
+
+    root.mainloop()
