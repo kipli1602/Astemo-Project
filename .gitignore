@@ -54,3 +54,7 @@ wandb/
 # Logs
 *.log
 logs/
+
+# Project Specific
+requirements.txt
+targets.json
