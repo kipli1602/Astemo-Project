@@ -1,3 +1,4 @@
+--extra-index-url https://download.pytorch.org/whl/cu124
 aiohappyeyeballs==2.7.1
 aiohttp==3.14.3
 aiosignal==1.4.0
@@ -39,12 +40,16 @@ mpmath==1.3.0
 multidict==6.7.1
 networkx==3.6.1
 numpy==1.26.4
+nvidia-cublas-cu11==11.11.3.6
+nvidia-cudnn-cu12==8.9.7.29
+nvidia-cuda-nvrtc-cu12==12.9.86
 nvidia-ml-py==13.610.43
 opencv-contrib-python==4.8.0.76
 opencv-python==4.8.0.76
 opt-einsum==3.3.0
 packaging==26.3
-paddlepaddle==2.6.2
+paddleocr==3.7.0
+paddlepaddle==3.3.1
 paddlex==3.7.2
 pandas==3.0.5
 pillow==12.3.0
@@ -52,7 +57,7 @@ polars==1.44.1
 polars-runtime-32==1.44.1
 prettytable==3.18.0
 propcache==0.5.2
-protobuf==7.36.1
+protobuf==3.20.2
 psutil==7.2.2
 py-cpuinfo==9.0.0
 pyclipper==1.4.0
@@ -70,9 +75,9 @@ ruamel.yaml==0.19.1
 safetensors==0.8.0
 shapely==2.1.2
 six==1.17.0
-sympy==1.14.0
-torch==2.13.0
-torchvision==0.28.0
+sympy==1.13.1
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
 tqdm==4.70.0
 typing-inspection==0.4.4
 typing_extensions==4.16.0
