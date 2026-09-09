@@ -1,29 +1,36 @@
 import sys
 import time
 import os
+import re
+import multiprocessing
+
+# Matikan PIR API dan MKLDNN default dari Paddle (jika perlu untuk menghindari konflik)
 os.environ["FLAGS_enable_pir_api"] = "0"
 os.environ["FLAGS_use_mkldnn"] = "0"
 
 import torch
+torch.set_num_threads(12)
 import cv2
-import tkinter as tk
-from tkinter import ttk
-from ultralytics import YOLO
-from paddleocr import PaddleOCR
 import numpy as np
-import re
+from ultralytics import YOLO
 
-def setup_device_ai():
-    """Mendeteksi dan mengonfigurasi GPU secara otomatis"""
-    if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        print(f"\n[INFO] GPU Terdeteksi & Aktif: {gpu_name}")
-        return True, 0
-    else:
-        print("\n[INFO] Peringatan: GPU tidak tersedia, sistem beralih menggunakan CPU.")
-        return False, 'cpu'
+from PySide6.QtCore import Qt, QThread, Signal, QTimer
+from PySide6.QtGui import QImage, QPixmap, QFont, QColor
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QVBoxLayout, QHBoxLayout,
+    QPushButton, QScrollArea, QFrame, QSizePolicy, QGraphicsDropShadowEffect,
+    QInputDialog, QMessageBox
+)
+import json
+import urllib.request
+import threading
 
+# Konfigurasi IP IoT (NodeMCU ESP8266)
+IOT_ESP_IP = "192.168.100.8"
 
+# ============================================================
+#  WORKER PADDLEOCR (MULTIPROCESSING)
+# ============================================================
 def _add_nvidia_dll_dirs():
     """Tambahkan direktori DLL NVIDIA ke PATH agar PaddlePaddle-GPU dapat menemukan cuDNN"""
     venv_site_packages = os.path.join(
@@ -43,10 +50,11 @@ def _add_nvidia_dll_dirs():
                 os.add_dll_directory(d)
                 os.environ["PATH"] = d + os.pathsep + os.environ["PATH"]
 
-
 def _ocr_worker(image_queue, result_queue, use_gpu):
     """Worker process untuk PaddleOCR — berjalan di proses terpisah agar tidak bertabrakan DLL dengan PyTorch"""
-    _add_nvidia_dll_dirs()
+    if use_gpu:
+        _add_nvidia_dll_dirs()
+        
     from paddleocr import PaddleOCR
 
     try:
@@ -57,7 +65,9 @@ def _ocr_worker(image_queue, result_queue, use_gpu):
             det_db_thresh=0.3,
             rec_algorithm='SVTR_LCNet',
             show_log=False,
-            use_gpu=use_gpu
+            use_gpu=use_gpu,
+            enable_mkldnn=not use_gpu,  # Tetap aktifkan MKL-DNN jika pakai CPU
+            cpu_threads=12
         )
     except Exception:
         ocr = PaddleOCR(use_textline_orientation=False, lang='en', use_angle_cls=True, show_log=False)
@@ -74,7 +84,6 @@ def _ocr_worker(image_queue, result_queue, use_gpu):
             result_queue.put((hasil_ocr1, hasil_ocr2))
         except Exception:
             result_queue.put((None, None))
-
 
 class OcrManager:
     """Mengelola proses worker PaddleOCR secara terpisah untuk menghindari konflik DLL pada Windows"""
@@ -101,6 +110,17 @@ class OcrManager:
             self.process.terminate()
             self.process.join(timeout=2)
 
+# ============================================================
+#  FUNGSI UTAMA AI (YOLO) & UTILITAS
+# ============================================================
+def setup_device_ai():
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        print(f"\n[INFO] GPU Terdeteksi & Aktif: {gpu_name}")
+        return True, 0  
+    else:
+        print("\n[INFO] Peringatan: GPU tidak tersedia, sistem beralih menggunakan CPU.")
+        return False, 'cpu'
 
 def preprocessing_gambar(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -138,37 +158,255 @@ def fuzzy_match(teks, target, toleransi=1):
             
     return False, 0
 
-def jalankan_inspeksi(target_kode):
-    print(f"\nSistem Aktif! Menyeleksi Kardus: {target_kode}")
-    
-    gunakan_gpu, device_yolo = setup_device_ai()
-    model = YOLO("best.pt") 
-    
-    try:
-        ocr = PaddleOCR(
-            use_textline_orientation=False, 
-            lang='en',
-            use_angle_cls=True, 
-            det_db_thresh=0.3,   
-            rec_algorithm='SVTR_LCNet', 
-            show_log=False,
-            use_gpu=gunakan_gpu
-        )
-    except Exception:
-        ocr = PaddleOCR(use_textline_orientation=False, lang='en', use_angle_cls=True, show_log=False)
-    
-    memori_kardus = {} 
-    
-    index_kamera_usb = 2
-    cap = cv2.VideoCapture(index_kamera_usb)
-    if not cap.isOpened():
-        print(f"[PERINGATAN] USB Webcam pada index {index_kamera_usb} tidak ditemukan. Mencoba beralih ke index 0...")
-        cap = cv2.VideoCapture(0)
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280) 
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+# ============================================================
+#  THEME / QSS - Astemo Light Industrial Identity
+# ============================================================
+# --- Konstanta Warna UI ---
+BACKGROUND       = "#F3F4F6"
+SIDEBAR          = "#FFFFFF"
+CARD             = "#FFFFFF"
+BORDER           = "#D1D5DB"
 
-    frame_counter = 0
+ASTEMO_RED       = "#C9002B"
+ASTEMO_RED_SOFT  = "#FDECEF"
+
+TEXT_MAIN        = "#1F2937"
+TEXT_MUTED       = "#6B7280"
+
+MATCH_GREEN      = "#16A34A"
+SCAN_YELLOW      = "#D97706"
+NG_RED           = "#DC2626"
+
+# --- QSS Styling ---
+ASTEMO_QSS = f"""
+QMainWindow, QDialog, QMessageBox, QInputDialog {{
+    background-color: {BACKGROUND};
+    color: {TEXT_MAIN};
+    font-family: 'Segoe UI', 'Arial', sans-serif;
+}}
+QWidget {{
+    color: {TEXT_MAIN};
+    font-family: 'Segoe UI', 'Arial', sans-serif;
+}}
+QLineEdit {{
+    background-color: #FFFFFF;
+    border: 1px solid {BORDER};
+    border-radius: 4px;
+    padding: 6px;
+    color: {TEXT_MAIN};
+    font-size: 14px;
+}}
+QLineEdit:focus {{
+    border: 1px solid {ASTEMO_RED};
+}}
+QDialog QPushButton, QMessageBox QPushButton {{
+    background-color: #FFFFFF;
+    border: 1px solid {BORDER};
+    border-radius: 4px;
+    padding: 6px 14px;
+    color: {TEXT_MAIN};
+    font-weight: bold;
+}}
+QDialog QPushButton:hover, QMessageBox QPushButton:hover {{
+    background-color: {BACKGROUND};
+}}
+QLabel {{
+    background-color: transparent;
+}}
+QScrollArea, QScrollArea > QWidget > QWidget {{
+    background-color: transparent;
+    border: none;
+}}
+QScrollBar:vertical {{
+    border: none;
+    background: transparent;
+    width: 6px;
+    margin: 0px;
+}}
+QScrollBar::handle:vertical {{
+    background: {BORDER};
+    border-radius: 3px;
+    min-height: 20px;
+}}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+    border: none;
+    background: none;
+    height: 0px;
+}}
+#CentralWidget {{
+    background-color: {BACKGROUND};
+}}
+#Sidebar {{
+    background-color: {SIDEBAR};
+    border-right: 1px solid {BORDER};
+}}
+#LogoBadge {{
+    background-color: {ASTEMO_RED};
+    border-radius: 8px;
+    color: #FFFFFF;
+    font-size: 20px;
+    font-weight: bold;
+}}
+#SidebarTitle {{
+    color: {TEXT_MAIN};
+    font-size: 15px;
+    font-weight: 800;
+    letter-spacing: 0.5px;
+}}
+#SidebarSubtitle {{
+    color: {TEXT_MUTED};
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 1px;
+}}
+#SectionLabel {{
+    color: {TEXT_MUTED};
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 1.5px;
+    padding: 10px 16px 6px 16px;
+}}
+QPushButton#TargetBtn {{
+    background-color: transparent;
+    border: none;
+    border-left: 4px solid transparent;
+    border-radius: 0px;
+    color: {TEXT_MUTED};
+    text-align: left;
+    padding: 12px 16px;
+    margin: 0px;
+    font-size: 14px;
+    font-weight: 700;
+}}
+QPushButton#TargetBtn:hover {{
+    background-color: {BORDER};
+    color: {TEXT_MAIN};
+}}
+QPushButton#TargetBtn[active="true"] {{
+    background-color: #FBD5DB;
+    border-left: 4px solid {ASTEMO_RED};
+    color: {ASTEMO_RED};
+}}
+QPushButton#ExitBtn {{
+    background-color: {ASTEMO_RED};
+    color: #FFFFFF;
+    border: none;
+    border-radius: 6px;
+    padding: 12px;
+    font-size: 14px;
+    font-weight: bold;
+    margin: 16px;
+}}
+QPushButton#ExitBtn:hover {{
+    background-color: #E60032;
+}}
+QPushButton#ManageBtn {{
+    background-color: transparent;
+    border: 1px solid {BORDER};
+    border-radius: 6px;
+    color: {TEXT_MUTED};
+    padding: 8px;
+    font-size: 12px;
+    font-weight: bold;
+}}
+QPushButton#ManageBtn:hover {{
+    background-color: {BORDER};
+    color: {TEXT_MAIN};
+}}
+#TopBar {{
+    background-color: {SIDEBAR};
+    border-bottom: 1px solid {BORDER};
+}}
+#TopBarTitle {{
+    color: {TEXT_MAIN};
+    font-size: 16px;
+    font-weight: bold;
+}}
+#KpiCard {{
+    background-color: {CARD};
+    border: none;
+    border-radius: 8px;
+}}
+#KpiLabel {{
+    color: {TEXT_MUTED};
+    font-size: 13px;
+    font-weight: bold;
+    letter-spacing: 1px;
+}}
+#KpiValueTarget, #KpiValueOk, #KpiValueNg {{
+    font-size: 34px;
+    font-weight: bold;
+}}
+#KpiValueTarget {{ color: {TEXT_MAIN}; }}
+#KpiValueOk {{ color: {MATCH_GREEN}; }}
+#KpiValueNg {{ color: {NG_RED}; }}
+#VideoFrame {{
+    background-color: #000000;
+    border: 2px solid {BORDER};
+    border-radius: 8px;
+}}
+#StatusBar {{
+    background-color: {SIDEBAR};
+    border-top: 1px solid {BORDER};
+    color: {TEXT_MUTED};
+    padding: 10px 16px;
+    font-size: 13px;
+}}
+"""
+
+
+# ============================================================
+#  VIDEO / AI THREAD
+# ============================================================
+class VideoCaptureThread(QThread):
+    frame_ready = Signal(object)              
+    stats_updated = Signal(int, int, int)          
+    log_updated = Signal(str, str) # Modifikasi Signal: Menambah tipe status (MATCH/NG/INFO) untuk warna UI               
+
+    def __init__(self, camera_index=2, loop_interval_ms=10, parent=None):
+        super().__init__(parent)
+        self.camera_index = camera_index
+        self.loop_interval_ms = loop_interval_ms
+        self._running = False
+        
+        # State Internal
+        self.target_kode = "K81"
+        self.memori_kardus = {}
+        self.total_sesuai = 0
+        self.total_nyasar = 0
+        self.total_terdeteksi = 0
+        self.frame_counter = 0
+
+        # Inisialisasi Model AI (YOLO + OcrManager)
+        self.log_updated.emit("Memuat model YOLO dan OCR (Multiprocessing)... Harap tunggu.", "INFO")
+        self.gunakan_gpu, self.device_yolo = setup_device_ai()
+        self.model = YOLO("best.pt")
+        
+        # Menggunakan OCR Manager (Worker Terpisah)
+        self.ocr_manager = OcrManager(use_gpu=self.gunakan_gpu)
+        
+        self.log_updated.emit("SYSTEM READY", "INFO")
+
+    def set_target(self, kode: str):
+        self.target_kode = kode
+        self.memori_kardus.clear()
+        self.total_sesuai = 0
+        self.total_nyasar = 0
+        self.log_updated.emit(f"Target sistem diubah secara real-time ke: {kode}", "INFO")
+
+    def run(self):
+        cap = cv2.VideoCapture(self.camera_index)
+        if not cap.isOpened():
+            print(f"[PERINGATAN] USB Webcam index {self.camera_index} tidak ditemukan. Beralih ke 0.")
+            cap = cv2.VideoCapture(0)
+            
+        # Atur resolusi kamera ke 720p (16:9) agar layar penuh
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            
+        self._running = True
 
         while self._running:
             loop_start = time.time()
@@ -219,8 +457,8 @@ def jalankan_inspeksi(target_kode):
                     if potongan_stiker.size > 0:
                         img_processed = preprocessing_gambar(potongan_stiker)
                         
-                        hasil_ocr1 = ocr.ocr(potongan_stiker, cls=False)
-                        hasil_ocr2 = ocr.ocr(img_processed, cls=False)
+                        # Memanggil OCR melalui Manager (Worker Process)
+                        hasil_ocr1, hasil_ocr2 = self.ocr_manager.ocr(potongan_stiker, img_processed)
                         
                         semua_teks = []
                         if hasil_ocr1 and hasil_ocr1[0] is not None:
@@ -652,27 +890,35 @@ class InspectionDashboard(QMainWindow):
             
         self.status_label.setText(message)
 
-    cap.release()
-    cv2.destroyAllWindows()
+    def _trigger_iot_alarm(self, endpoint):
+        """Menembak sinyal IoT HTTP GET ke NodeMCU tanpa membuat antarmuka (UI) freeze/lag."""
+        url = f"http://{IOT_ESP_IP}{endpoint}"
+        try:
+            # Timeout 1 detik sudah cukup untuk kirim perintah ringan di jaringan lokal
+            urllib.request.urlopen(url, timeout=1.0)
+            print(f"[DEBUG] IoT Relay Sukses dieksekusi: {url}")
+        except Exception as e:
+            print(f"[DEBUG] IoT Relay Gagal terhubung ke {url} -> {e}")
 
-def mulai_program():
-    target_dipilih = combo_target.get()
-    if target_dipilih:
-        root.destroy() 
-        jalankan_inspeksi(target_dipilih) 
+    def _update_clock(self):
+        self.clock_label.setText(time.strftime("%H:%M:%S"))
 
-root = tk.Tk()
-root.title("Menu Operator Inspeksi")
-root.geometry("300x200")
-root.eval('tk::PlaceWindow . center')
+    def closeEvent(self, event):
+        self.video_thread.stop()
+        event.accept()
 
-tk.Label(root, text="Pilih Target Hari Ini:", font=("Arial", 12)).pack(pady=20)
-
-daftar_kode = ["K81", "K80", "K59", "K93"]
-combo_target = ttk.Combobox(root, values=daftar_kode, font=("Arial", 14), state="readonly")
-combo_target.current(0) 
-combo_target.pack(pady=10)
-
-tk.Button(root, text="Mulai Kamera Inspeksi", command=mulai_program, bg="green", fg="white", font=("Arial", 12)).pack(pady=20)
-
-root.mainloop()
+# ============================================================
+#  ENTRY POINT
+# ============================================================
+if __name__ == "__main__":
+    # SANGAT PENTING: Mencegah infinite loop spawning di OS Windows saat pakai Multiprocessing
+    multiprocessing.freeze_support()
+    
+    app = QApplication(sys.argv)
+    
+    # Terapkan QSS ke seluruh aplikasi (termasuk popup/dialog)
+    app.setStyleSheet(ASTEMO_QSS)
+    
+    window = InspectionDashboard()
+    window.show()
+    sys.exit(app.exec())

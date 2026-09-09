@@ -20,6 +20,7 @@ env.bak/
 # IDE
 .idea/
 .vscode/
+.vs/
 *.swp
 *.swo
 *~
