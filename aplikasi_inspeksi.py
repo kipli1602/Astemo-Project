@@ -3,34 +3,33 @@ import time
 import os
 import re
 import multiprocessing
+import threading
+import queue
 
 # Matikan PIR API dan MKLDNN default dari Paddle (jika perlu untuk menghindari konflik)
 os.environ["FLAGS_enable_pir_api"] = "0"
 os.environ["FLAGS_use_mkldnn"] = "0"
 
 import torch
-torch.set_num_threads(12)
+torch.set_num_threads(4)
 import cv2
 import numpy as np
 from ultralytics import YOLO
 
-from PySide6.QtCore import Qt, QThread, Signal, QTimer
-from PySide6.QtGui import QImage, QPixmap, QFont, QColor
-from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QLabel, QVBoxLayout, QHBoxLayout,
-    QPushButton, QScrollArea, QFrame, QSizePolicy, QGraphicsDropShadowEffect,
-    QInputDialog, QMessageBox
-)
 import json
-import urllib.request
-import threading
+# [IOT DISABLED] import urllib.request
+# [IOT DISABLED] import threading
 
 # Konfigurasi IP IoT (NodeMCU ESP8266)
-IOT_ESP_IP = "192.168.100.8"
+# [IOT DISABLED] IOT_ESP_IP = "192.168.100.8"
 
 # ============================================================
 #  WORKER PADDLEOCR (MULTIPROCESSING)
 # ============================================================
+_OCR_BACKEND = None
+_OCR_BACKEND_ERROR = None
+_NVIDIA_DLL_HANDLES = []
+
 def _add_nvidia_dll_dirs():
     """Tambahkan direktori DLL NVIDIA ke PATH agar PaddlePaddle-GPU dapat menemukan cuDNN"""
     venv_site_packages = os.path.join(
@@ -47,68 +46,135 @@ def _add_nvidia_dll_dirs():
         ]:
             d = os.path.join(base, pattern)
             if os.path.isdir(d):
-                os.add_dll_directory(d)
+                _NVIDIA_DLL_HANDLES.append(os.add_dll_directory(d))
                 os.environ["PATH"] = d + os.pathsep + os.environ["PATH"]
 
-def _ocr_worker(image_queue, result_queue, use_gpu):
-    """Worker process untuk PaddleOCR — berjalan di proses terpisah agar tidak bertabrakan DLL dengan PyTorch"""
+def _load_ocr_backend(use_gpu):
     if use_gpu:
         _add_nvidia_dll_dirs()
-        
+    import paddle
     from paddleocr import PaddleOCR
+    return paddle, PaddleOCR
 
+
+def _ocr_text(result):
+    if not result or result[0] is None:
+        return ''
+    return ' '.join(line[1][0] for line in result[0])
+
+
+def _matches_ocr_target(result, target):
+    # Gunakan aturan keputusan akhir yang sama, termasuk format part number.
+    return bool(target and fuzzy_match(_ocr_text(result), target, toleransi=1)[0])
+
+
+def read_ocr_crop(ocr, img, target, prefer_processed=False):
+    started = time.perf_counter()
+    first = None
+    second = None
+    raw_seconds = 0.0
+    prep_seconds = 0.0
+    fallback_seconds = 0.0
+    order = ('processed', 'raw') if prefer_processed else ('raw', 'processed')
+    for variant in order:
+        stage_started = time.perf_counter()
+        if variant == 'raw':
+            first = ocr.ocr(img, cls=False)
+            raw_seconds = time.perf_counter() - stage_started
+            result = first
+        else:
+            processed = preprocessing_gambar(img)
+            prep_done = time.perf_counter()
+            second = ocr.ocr(processed, cls=False)
+            prep_seconds = prep_done - stage_started
+            fallback_seconds = time.perf_counter() - prep_done
+            result = second
+        if _matches_ocr_target(result, target):
+            break
+    timings = dict(raw=raw_seconds, preprocessing=prep_seconds,
+                   fallback=fallback_seconds, total=time.perf_counter() - started)
+    return first, second, timings
+
+
+def _ocr_worker(image_queue, result_queue, use_gpu):
+    """OCR dan preprocessing tidak menahan thread kamera maupun YOLO."""
     try:
+        if _OCR_BACKEND_ERROR:
+            raise RuntimeError(_OCR_BACKEND_ERROR)
+        paddle, PaddleOCR = _OCR_BACKEND or _load_ocr_backend(use_gpu)
+        use_gpu = use_gpu and paddle.is_compiled_with_cuda()
         ocr = PaddleOCR(
-            use_textline_orientation=False,
-            lang='en',
-            use_angle_cls=True,
-            det_db_thresh=0.3,
-            rec_algorithm='SVTR_LCNet',
-            show_log=False,
-            use_gpu=use_gpu,
-            enable_mkldnn=not use_gpu,  # Tetap aktifkan MKL-DNN jika pakai CPU
-            cpu_threads=12
+            lang='en', use_angle_cls=False, det_db_thresh=0.3,
+            rec_algorithm='SVTR_LCNet', show_log=False,
+            use_gpu=use_gpu, enable_mkldnn=not use_gpu, cpu_threads=4,
         )
-    except Exception:
-        ocr = PaddleOCR(use_textline_orientation=False, lang='en', use_angle_cls=True, show_log=False)
+        result_queue.put(('ready', 'GPU' if use_gpu else 'CPU'))
+    except Exception as exc:
+        result_queue.put(('error', f'Inisialisasi OCR gagal: {exc}'))
+        return
 
+    preferred_processed = False
+    previous_target = None
     while True:
         item = image_queue.get()
         if item is None:
             break
-
-        img, img_processed = item
+        job_id, img, target = item
         try:
-            hasil_ocr1 = ocr.ocr(img, cls=False)
-            hasil_ocr2 = ocr.ocr(img_processed, cls=False)
-            result_queue.put((hasil_ocr1, hasil_ocr2))
-        except Exception:
-            result_queue.put((None, None))
+            if target != previous_target:
+                preferred_processed = False
+                previous_target = target
+            first, second, timings = read_ocr_crop(ocr, img, target, preferred_processed)
+            if _matches_ocr_target(second, target):
+                preferred_processed = True
+            elif _matches_ocr_target(first, target):
+                preferred_processed = False
+            print(f"[OCR #{job_id}] " + ' '.join(
+                f'{stage}={seconds:.3f}s' for stage, seconds in timings.items()), flush=True)
+            print(f"[OCR #{job_id}] target={target!r} raw_text={_ocr_text(first)!r} "
+                  f"processed_text={_ocr_text(second)!r} "
+                  f"next_first={'processed' if preferred_processed else 'raw'}", flush=True)
+            result_queue.put(('result', job_id, first, second, None))
+        except Exception as exc:
+            result_queue.put(('result', job_id, None, None, str(exc)))
+
 
 class OcrManager:
-    """Mengelola proses worker PaddleOCR secara terpisah untuk menghindari konflik DLL pada Windows"""
     def __init__(self, use_gpu):
         ctx = multiprocessing.get_context('spawn')
-        self.image_queue = ctx.Queue()
-        self.result_queue = ctx.Queue()
+        self.image_queue = ctx.Queue(maxsize=1)
+        self.result_queue = ctx.Queue(maxsize=2)
         self.process = ctx.Process(
-            target=_ocr_worker,
-            args=(self.image_queue, self.result_queue, use_gpu),
-            daemon=True
+            target=_ocr_worker, name="astemo-ocr",
+            args=(self.image_queue, self.result_queue, use_gpu), daemon=True,
         )
         self.process.start()
 
-    def ocr(self, img, img_processed):
-        """Kirim gambar ke worker proses, terima hasil OCR"""
-        self.image_queue.put((img, img_processed))
-        return self.result_queue.get()
+    def submit(self, job_id, img, target=''):
+        try:
+            self.image_queue.put_nowait((job_id, img.copy(), target))
+            return True
+        except queue.Full:
+            return False
+
+    def poll(self):
+        try:
+            return self.result_queue.get_nowait()
+        except queue.Empty:
+            return None
 
     def shutdown(self):
-        self.image_queue.put(None)
-        self.process.join(timeout=5)
+        try:
+            self.image_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        self.process.join(timeout=2)
         if self.process.is_alive():
             self.process.terminate()
             self.process.join(timeout=2)
+        for channel in (self.image_queue, self.result_queue):
+            channel.cancel_join_thread()
+            channel.close()
 
 # ============================================================
 #  FUNGSI UTAMA AI (YOLO) & UTILITAS
@@ -158,6 +224,45 @@ def fuzzy_match(teks, target, toleransi=1):
             
     return False, 0
 
+
+def enumerate_cameras(max_scan=10):
+    """Scan index 0..max_scan dan kembalikan list of (index, nama_device) untuk kamera yang bisa dibuka."""
+    cameras = []
+    for i in range(max_scan):
+        try:
+            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+            if cap.isOpened():
+                ret, _ = cap.read()
+                if ret:
+                    name = cap.getBackendName()
+                    try:
+                        device_name = cap.get(cv2.CAP_PROP_DEVICE_NAME)
+                        if device_name and str(device_name).strip():
+                            name = str(device_name).strip()
+                    except Exception:
+                        pass
+                    cameras.append((i, name if name else f"Camera {i}"))
+                cap.release()
+        except Exception:
+            pass
+    return cameras
+
+
+# Windows spawn mengimpor ulang modul aplikasi. Muat backend OCR sebelum Qt,
+# agar hook import PySide tidak memperlambat pemuatan SciPy/PaddleOCR.
+if multiprocessing.current_process().name == 'astemo-ocr':
+    try:
+        _OCR_BACKEND = _load_ocr_backend(torch.cuda.is_available())
+    except Exception as exc:
+        _OCR_BACKEND_ERROR = str(exc)
+
+from PySide6.QtCore import Qt, QThread, Signal, QTimer
+from PySide6.QtGui import QImage, QPixmap, QFont, QColor
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QVBoxLayout, QHBoxLayout,
+    QPushButton, QScrollArea, QFrame, QSizePolicy, QGraphicsDropShadowEffect,
+    QInputDialog, QMessageBox, QComboBox
+)
 
 # ============================================================
 #  THEME / QSS - Astemo Light Industrial Identity
@@ -354,6 +459,37 @@ QPushButton#ManageBtn:hover {{
     padding: 10px 16px;
     font-size: 13px;
 }}
+QComboBox#CameraSelector {{
+    background-color: #FFFFFF;
+    border: 1px solid {BORDER};
+    border-radius: 6px;
+    color: {TEXT_MAIN};
+    padding: 6px 10px;
+    font-size: 12px;
+    font-weight: bold;
+}}
+QComboBox#CameraSelector:hover {{
+    border: 1px solid {ASTEMO_RED};
+}}
+QComboBox#CameraSelector::drop-down {{
+    border: none;
+    width: 24px;
+}}
+QComboBox#CameraSelector::down-arrow {{
+    image: none;
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-top: 6px solid {TEXT_MUTED};
+    margin-right: 8px;
+}}
+QComboBox#CameraSelector QAbstractItemView {{
+    background-color: #FFFFFF;
+    border: 1px solid {BORDER};
+    color: {TEXT_MAIN};
+    selection-background-color: {ASTEMO_RED_SOFT};
+    selection-color: {ASTEMO_RED};
+    padding: 4px;
+}}
 """
 
 
@@ -374,59 +510,160 @@ class VideoCaptureThread(QThread):
         # State Internal
         self.target_kode = "K81"
         self.memori_kardus = {}
-        self.total_sesuai = 0
-        self.total_nyasar = 0
         self.total_terdeteksi = 0
         self.frame_counter = 0
 
-        # Inisialisasi Model AI (YOLO + OcrManager)
-        self.log_updated.emit("Memuat model YOLO dan OCR (Multiprocessing)... Harap tunggu.", "INFO")
-        self.gunakan_gpu, self.device_yolo = setup_device_ai()
-        self.model = YOLO("best.pt")
-        
-        # Menggunakan OCR Manager (Worker Terpisah)
-        self.ocr_manager = OcrManager(use_gpu=self.gunakan_gpu)
-        
-        self.log_updated.emit("SYSTEM READY", "INFO")
+        self._stop_event = threading.Event()
+        self._frames = queue.Queue(maxsize=1)
+        self._state_lock = threading.Lock()
+        self._target_revision = 0
+        self._ai_revision = 0
+        self._overlays = (0.0, 0, [])
+        self._preview_pending = False
+        self.ocr_manager = None
+        self._ocr_ready = False
+        self._ocr_failed = False
+        self._pending_ocr = None
+        self._job_counter = 0
 
     def set_target(self, kode: str):
-        self.target_kode = kode
-        self.memori_kardus.clear()
-        self.total_sesuai = 0
-        self.total_nyasar = 0
+        with self._state_lock:
+            self.target_kode = kode
+            self._target_revision += 1
+            self._overlays = (0.0, self._target_revision, [])
         self.log_updated.emit(f"Target sistem diubah secara real-time ke: {kode}", "INFO")
 
     def run(self):
-        cap = cv2.VideoCapture(self.camera_index)
-        if not cap.isOpened():
-            print(f"[PERINGATAN] USB Webcam index {self.camera_index} tidak ditemukan. Beralih ke 0.")
-            cap = cv2.VideoCapture(0)
-            
-        # Atur resolusi kamera ke 720p (16:9) agar layar penuh
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-            
-        self._running = True
+        cap = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
+        ai_thread = None
+        try:
+            if not cap.isOpened() and self.camera_index != 0:
+                cap.release()
+                cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                self.log_updated.emit("Kamera tidak dapat dibuka.", "INFO")
+                return
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            ai_thread = threading.Thread(target=self._run_ai, daemon=True)
+            ai_thread.start()
+            self._running = True
+            while not self._stop_event.is_set():
+                ok, frame = cap.read()
+                if not ok:
+                    self.msleep(20)
+                    continue
+                # Satu frame terbaru: frame lama tidak menumpuk di belakang AI.
+                try:
+                    self._frames.get_nowait()
+                except queue.Empty:
+                    pass
+                self._frames.put_nowait((time.monotonic(), frame.copy()))
+                with self._state_lock:
+                    timestamp, revision, overlays = self._overlays
+                    revision_now = self._target_revision
+                if revision == revision_now and time.monotonic() - timestamp < 0.5:
+                    for (x1, y1, x2, y2), color, label in overlays:
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+                        cv2.putText(frame, label, (x1, max(20, y1 - 10)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                # Maksimal satu update UI tertunda.
+                if not self._preview_pending:
+                    self._preview_pending = True
+                    self.frame_ready.emit(frame)
+        finally:
+            cap.release()
+            self._running = False
+            self._stop_event.set()
+            if ai_thread is not None:
+                ai_thread.join()
 
-        while self._running:
-            loop_start = time.time()
-            ok, frame = cap.read()
-            if not ok:
-                continue
+    def _run_ai(self):
+        try:
+            self.gunakan_gpu, self.device_yolo = setup_device_ai()
+            self.log_updated.emit(f"YOLO: {'GPU' if self.gunakan_gpu else 'CPU'}; memuat OCR...", "INFO")
+            self.model = YOLO(os.path.join(os.path.dirname(__file__), 'best.pt'))
+            self.ocr_manager = OcrManager(use_gpu=self.gunakan_gpu)
+            while not self._stop_event.is_set():
+                try:
+                    captured_at, frame = self._frames.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                with self._state_lock:
+                    revision, target = self._target_revision, self.target_kode
+                if revision != self._ai_revision:
+                    self.memori_kardus.clear()
+                    self._ai_revision = revision
+                self._active_target = target
+                overlays = self.process_frame(frame)
+                with self._state_lock:
+                    if revision == self._target_revision:
+                        self._overlays = (captured_at, revision, overlays)
+                self.stats_updated.emit(
+                    sum(v['status'] == 'Sesuai' for v in self.memori_kardus.values()),
+                    sum(v['status'] == 'Tidak Sesuai' for v in self.memori_kardus.values()),
+                    self.total_terdeteksi,
+                )
+        except Exception as exc:
+            self.log_updated.emit(f"Proses AI gagal: {exc}", "INFO")
+        finally:
+            if self.ocr_manager is not None:
+                self.ocr_manager.shutdown()
 
-            frame = self.process_frame(frame)
-            
-            self.frame_ready.emit(frame.copy())
-            self.stats_updated.emit(self.total_sesuai, self.total_nyasar, self.total_terdeteksi)
+    def _poll_ocr(self):
+        while True:
+            message = self.ocr_manager.poll()
+            if message is None:
+                break
+            if message[0] == 'ready':
+                self._ocr_ready = True
+                self.log_updated.emit(f"OCR siap: {message[1]}", "INFO")
+            elif message[0] == 'error':
+                self._ocr_failed = True
+                self.log_updated.emit(message[1], "INFO")
+            elif message[0] == 'result':
+                _, job_id, first, second, error = message
+                pending = self._pending_ocr
+                if pending is None or pending[0] != job_id:
+                    continue
+                self._pending_ocr = None
+                _, revision, box_id, state, submitted_at = pending
+                print(f"[OCR #{job_id}] box={box_id} revision={revision} "
+                      f"elapsed={time.monotonic()-submitted_at:.3f}s "
+                      f"mismatch_count={state.get('gagal_hitung', 0)}", flush=True)
+                if error:
+                    self.log_updated.emit(f"OCR gagal: {error}", "INFO")
+                    continue
+                if (revision != self._ai_revision or revision != self._target_revision
+                        or self.memori_kardus.get(box_id) is not state):
+                    continue
+                words = []
+                for result in (first, second):
+                    if result and result[0] is not None:
+                        words.extend(line[1][0] for line in result[0])
+                text = ' '.join(words)
+                if text.strip():
+                    match, confidence = fuzzy_match(text, self._active_target, toleransi=1)
+                    state.update(teks=text, confidence=confidence)
+                    if match:
+                        state['status'] = 'Sesuai'
+                        self.log_updated.emit(f"Kardus #{box_id} -> OCR: {text} -> MATCH", "MATCH")
+                    else:
+                        state['gagal_hitung'] += 1
+                        if state['gagal_hitung'] > 4:
+                            state['status'] = 'Tidak Sesuai'
+                            self.log_updated.emit(f"Kardus #{box_id} -> OCR: {text} -> NG", "NG")
+        if not self._ocr_failed:
+            timed_out = self._pending_ocr and time.monotonic() - self._pending_ocr[4] > 30
+            if not self.ocr_manager.process.is_alive() or timed_out:
+                self._ocr_failed = True
+                self._ocr_ready = False
+                self.log_updated.emit("OCR berhenti atau melewati batas 30 detik. Mulai ulang kamera untuk mencoba lagi.", "INFO")
 
-            elapsed_ms = (time.time() - loop_start) * 1000
-            sleep_ms = max(0, self.loop_interval_ms - elapsed_ms)
-            self.msleep(int(sleep_ms))
-
-        cap.release()
-
-    def process_frame(self, frame: np.ndarray) -> np.ndarray:
+    def process_frame(self, frame: np.ndarray) -> list:
         self.frame_counter += 1
+        self._poll_ocr()
+        overlays = []
         
         # 1. Jalankan Tracking YOLO
         results = self.model.track(frame, persist=True, conf=0.6, tracker="botsort.yaml", device=self.device_yolo, verbose=False)
@@ -436,7 +673,10 @@ class VideoCaptureThread(QThread):
             boxes = results[0].boxes.xyxy.cpu().numpy()
             ids = results[0].boxes.id.cpu().numpy()
             
-            for box, id_kardus in zip(boxes, ids):
+            # Dahulukan kardus yang paling lama belum mendapat giliran OCR.
+            candidates = sorted(zip(boxes, ids), key=lambda item:
+                self.memori_kardus.get(int(item[1]), {}).get("last_ocr", 0))
+            for box, id_kardus in candidates:
                 x1, y1, x2, y2 = map(int, box)
                 id_kardus = int(id_kardus)
                 id_aktif_di_frame.add(id_kardus)
@@ -448,45 +688,20 @@ class VideoCaptureThread(QThread):
                         "teks": "", 
                         "confidence": 0, 
                         "gagal_hitung": 0,
-                        "counted": False
                     }
                 
-                # 2. Lakukan OCR setiap 5 frame jika masih "Scanning..."
-                if self.memori_kardus[id_kardus]["status"] == "Scanning..." and (self.frame_counter % 5 == 0):
-                    potongan_stiker = frame[y1:y2, x1:x2]
-                    if potongan_stiker.size > 0:
-                        img_processed = preprocessing_gambar(potongan_stiker)
-                        
-                        # Memanggil OCR melalui Manager (Worker Process)
-                        hasil_ocr1, hasil_ocr2 = self.ocr_manager.ocr(potongan_stiker, img_processed)
-                        
-                        semua_teks = []
-                        if hasil_ocr1 and hasil_ocr1[0] is not None:
-                            semua_teks.extend([baris[1][0] for baris in hasil_ocr1[0]])
-                        if hasil_ocr2 and hasil_ocr2[0] is not None:
-                            semua_teks.extend([baris[1][0] for baris in hasil_ocr2[0]])
-                        
-                        teks_lengkap = " ".join(semua_teks)
-                        
-                        if teks_lengkap.strip():
-                            cocok, confidence = fuzzy_match(teks_lengkap, self.target_kode, toleransi=1)
-                            self.memori_kardus[id_kardus]["teks"] = teks_lengkap
-                            self.memori_kardus[id_kardus]["confidence"] = confidence
-                            
-                            if cocok:
-                                self.memori_kardus[id_kardus]["status"] = "Sesuai"
-                                if not self.memori_kardus[id_kardus]["counted"]:
-                                    self.total_sesuai += 1
-                                    self.memori_kardus[id_kardus]["counted"] = True
-                                    self.log_updated.emit(f"Kardus #{id_kardus} → OCR: {teks_lengkap} → MATCH", "MATCH")
-                            else:
-                                self.memori_kardus[id_kardus]["gagal_hitung"] += 1
-                                if self.memori_kardus[id_kardus]["gagal_hitung"] > 4:
-                                    self.memori_kardus[id_kardus]["status"] = "Tidak Sesuai"
-                                    if not self.memori_kardus[id_kardus]["counted"]:
-                                        self.total_nyasar += 1
-                                        self.memori_kardus[id_kardus]["counted"] = True
-                                        self.log_updated.emit(f"Kardus #{id_kardus} → OCR: {teks_lengkap} → NG", "NG")
+                # Jadwalkan satu crop; hasil dibaca pada iterasi AI berikutnya.
+                state = self.memori_kardus[id_kardus]
+                if (state['status'] == 'Scanning...' and self._ocr_ready
+                        and not self._ocr_failed and self._pending_ocr is None):
+                    h, w = frame.shape[:2]
+                    crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+                    if crop.size > 0:
+                        self._job_counter += 1
+                        if self.ocr_manager.submit(self._job_counter, crop, self._active_target):
+                            state["last_ocr"] = self._job_counter
+                            self._pending_ocr = (self._job_counter, self._ai_revision,
+                                                 id_kardus, state, time.monotonic())
 
                 # 3. Visualisasi Bounding Box (Warna sesuai request BGR: OpenCV)
                 warna_kotak = (6, 119, 217) # BGR untuk SCAN_YELLOW (#D97706)
@@ -496,7 +711,7 @@ class VideoCaptureThread(QThread):
 
                 if status == "Sesuai":
                     warna_kotak = (74, 163, 22) # BGR untuk MATCH_GREEN (#16A34A)
-                    teks_label = f"ID:{id_kardus} | {self.target_kode} OK ({confidence}%)"
+                    teks_label = f"ID:{id_kardus} | {self._active_target} OK ({confidence}%)"
                 elif status == "Tidak Sesuai":
                     warna_kotak = (38, 38, 220) # BGR untuk NG_RED (#DC2626)
                     teks_pendek = teks_ocr[:15] if len(teks_ocr) > 15 else teks_ocr
@@ -504,8 +719,7 @@ class VideoCaptureThread(QThread):
                 else:
                     teks_label = f"ID:{id_kardus} | Scanning..."
 
-                cv2.rectangle(frame, (x1, y1), (x2, y2), warna_kotak, 3)
-                cv2.putText(frame, teks_label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, warna_kotak, 2)
+                overlays.append(((x1, y1, x2, y2), warna_kotak, teks_label))
 
         # Hapus kardus dari memori jika sudah hilang dari frame (agar memori tidak bocor)
         id_dalam_memori = list(self.memori_kardus.keys())
@@ -514,13 +728,11 @@ class VideoCaptureThread(QThread):
                 del self.memori_kardus[id_kardus]
 
         self.total_terdeteksi = len(id_aktif_di_frame)
-        return frame
+        return overlays
 
     def stop(self):
-        self._running = False
+        self._stop_event.set()
         self.wait()
-        # Matikan process OCR saat thread ini dihentikan
-        self.ocr_manager.shutdown()
 
 # ============================================================
 #  MAIN WINDOW (PySide6 Redesign)
@@ -548,7 +760,12 @@ class InspectionDashboard(QMainWindow):
         root_layout.addWidget(self._build_main_area(), stretch=1)
 
         # --- start AI/video thread ---
-        self.video_thread = VideoCaptureThread(camera_index=1, loop_interval_ms=10)
+        # Ambil index kamera pertama yang terdeteksi, fallback ke 0
+        initial_cam = 0
+        if self._camera_map:
+            initial_cam = next(iter(self._camera_map.values()))
+
+        self.video_thread = VideoCaptureThread(camera_index=initial_cam, loop_interval_ms=10)
         self.video_thread.frame_ready.connect(self.on_frame_ready)
         self.video_thread.stats_updated.connect(self.on_stats_updated)
         self.video_thread.log_updated.connect(self.on_log_updated)
@@ -622,6 +839,36 @@ class InspectionDashboard(QMainWindow):
         
         # Stretch diletakkan di bawah list agar list menempel di atas
         layout.addStretch()
+
+        # --- KAMERA SELECTOR ---
+        cam_section_lbl = QLabel("KAMERA")
+        cam_section_lbl.setObjectName("SectionLabel")
+        layout.addWidget(cam_section_lbl)
+
+        cam_row = QHBoxLayout()
+        cam_row.setContentsMargins(16, 0, 16, 4)
+
+        self.camera_combo = QComboBox()
+        self.camera_combo.setObjectName("CameraSelector")
+        self.camera_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.camera_combo.setMinimumHeight(36)
+
+        detected = enumerate_cameras()
+        self._camera_map = {}  # displayName -> index
+        for idx, name in detected:
+            display = f"[{idx}] {name}"
+            self.camera_combo.addItem(display)
+            self._camera_map[display] = idx
+
+        if not detected:
+            self.camera_combo.addItem("Tidak ada kamera")
+            self._camera_map = {}
+
+        self.camera_combo.currentTextChanged.connect(self._on_camera_changed)
+        cam_row.addWidget(self.camera_combo)
+        layout.addLayout(cam_row)
+
+        layout.addSpacing(8)
 
         # Tombol Manage Target (Tambah / Hapus)
         manage_layout = QHBoxLayout()
@@ -862,7 +1109,40 @@ class InspectionDashboard(QMainWindow):
             btn.style().unpolish(btn)
             btn.style().polish(btn)
 
+    def _on_camera_changed(self, display_name: str):
+        if display_name not in self._camera_map:
+            return
+        new_index = self._camera_map[display_name]
+        print(f"[DEBUG] Pengguna memilih kamera: index {new_index} ({display_name})")
+        self._switch_camera(new_index)
+
+    def _switch_camera(self, new_index: int):
+        if not hasattr(self, 'video_thread'):
+            return
+        if self.video_thread.camera_index == new_index:
+            return
+
+        current_target = self.video_thread.target_kode
+
+        self.video_thread.stop()
+
+        self.video_thread = VideoCaptureThread(camera_index=new_index, loop_interval_ms=10)
+        self.video_thread.frame_ready.connect(self.on_frame_ready)
+        self.video_thread.stats_updated.connect(self.on_stats_updated)
+        self.video_thread.log_updated.connect(self.on_log_updated)
+        if current_target:
+            self.video_thread.set_target(current_target)
+        self.video_thread.start()
+
+        self.status_label.setText(f"Beralih ke kamera index {new_index}")
+        self.status_label.setStyleSheet(f"color: {TEXT_MUTED}; font-weight: normal;")
+
     def on_frame_ready(self, frame: np.ndarray):
+        source = self.sender()
+        if source is not None:
+            source._preview_pending = False
+            if source is not self.video_thread:
+                return
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
@@ -881,24 +1161,24 @@ class InspectionDashboard(QMainWindow):
         # Perubahan UI: Memberikan warna pada log status bar sesuai kejadian
         if msg_type == "MATCH":
             self.status_label.setStyleSheet(f"color: {MATCH_GREEN}; font-weight: bold;")
-            threading.Thread(target=self._trigger_iot_alarm, args=("/hijau",), daemon=True).start()
+            # [IOT DISABLED] threading.Thread(target=self._trigger_iot_alarm, args=("/hijau",), daemon=True).start()
         elif msg_type == "NG":
             self.status_label.setStyleSheet(f"color: {NG_RED}; font-weight: bold;")
-            threading.Thread(target=self._trigger_iot_alarm, args=("/merah",), daemon=True).start()
+            # [IOT DISABLED] threading.Thread(target=self._trigger_iot_alarm, args=("/merah",), daemon=True).start()
         else:
             self.status_label.setStyleSheet(f"color: {TEXT_MUTED}; font-weight: normal;")
             
         self.status_label.setText(message)
 
-    def _trigger_iot_alarm(self, endpoint):
-        """Menembak sinyal IoT HTTP GET ke NodeMCU tanpa membuat antarmuka (UI) freeze/lag."""
-        url = f"http://{IOT_ESP_IP}{endpoint}"
-        try:
-            # Timeout 1 detik sudah cukup untuk kirim perintah ringan di jaringan lokal
-            urllib.request.urlopen(url, timeout=1.0)
-            print(f"[DEBUG] IoT Relay Sukses dieksekusi: {url}")
-        except Exception as e:
-            print(f"[DEBUG] IoT Relay Gagal terhubung ke {url} -> {e}")
+    # [IOT DISABLED] def _trigger_iot_alarm(self, endpoint):
+        # [IOT DISABLED] """Menembak sinyal IoT HTTP GET ke NodeMCU tanpa membuat antarmuka (UI) freeze/lag."""
+        # [IOT DISABLED] url = f"http://{IOT_ESP_IP}{endpoint}"
+        # [IOT DISABLED] try:
+            # [IOT DISABLED] # Timeout 1 detik sudah cukup untuk kirim perintah ringan di jaringan lokal
+            # [IOT DISABLED] urllib.request.urlopen(url, timeout=1.0)
+            # [IOT DISABLED] print(f"[DEBUG] IoT Relay Sukses dieksekusi: {url}")
+        # [IOT DISABLED] except Exception as e:
+            # [IOT DISABLED] print(f"[DEBUG] IoT Relay Gagal terhubung ke {url} -> {e}")
 
     def _update_clock(self):
         self.clock_label.setText(time.strftime("%H:%M:%S"))
